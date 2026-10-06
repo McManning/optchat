@@ -36,6 +36,12 @@ export interface LogMessage {
   date: string;
 }
 
+export type OptChatExtensionFactory = ((
+  pi: ExtensionAPI
+) => void | Promise<void>) & {
+  shutdown: () => void;
+};
+
 export interface TreeNode {
   l: number; // level (0 = message summary)
   i: number; // index in level (covers [i * 2^l, (i+1) * 2^l))
@@ -50,6 +56,39 @@ export interface OptChatConfig {
   viewSize: number;
   concurrency: number;
   compactorModel?: string;
+}
+
+export interface OptChatExtensionOptions {
+  identity?: string;
+  memoryPath?: string;
+  getSummarizerModel?: () => string | undefined;
+}
+
+type ChatModel = NonNullable<
+  ReturnType<ExtensionContext["modelRegistry"]["find"]>
+>;
+
+function resolveConfiguredModel(
+  ctx: ExtensionContext,
+  modelRef: string
+): ChatModel {
+  const separator = modelRef.indexOf("/");
+  if (separator <= 0 || separator === modelRef.length - 1) {
+    throw new Error(
+      `Invalid OptChat summarizer model '${modelRef}'. Use provider/model-id.`
+    );
+  }
+
+  const model = ctx.modelRegistry.find(
+    modelRef.slice(0, separator),
+    modelRef.slice(separator + 1)
+  );
+  if (!model) {
+    throw new Error(
+      `OptChat summarizer model '${modelRef}' was not found in Pi's model registry.`
+    );
+  }
+  return model;
 }
 
 export interface ViewPart {
@@ -502,9 +541,7 @@ export class OptChatMemory {
 export class OptChatCompactor {
   private mem: OptChatMemory;
   private ctx: ExtensionContext;
-  public readonly model?: NonNullable<
-    ReturnType<ExtensionContext["modelRegistry"]["find"]>
-  >;
+  private getSummarizerModel: () => string | undefined;
   private activeJobs = new Set<string>();
   private failedJobs = new Map<string, number>(); // key -> timestamp of failure
   private isPumpRunning = false;
@@ -512,11 +549,28 @@ export class OptChatCompactor {
   constructor(
     mem: OptChatMemory,
     ctx: ExtensionContext,
-    model?: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>
+    getSummarizerModel: () => string | undefined
   ) {
     this.mem = mem;
     this.ctx = ctx;
-    this.model = model;
+    this.getSummarizerModel = getSummarizerModel;
+  }
+
+  public get modelReference(): string {
+    return this.getSummarizerModel()?.trim() || "active Pi model";
+  }
+
+  public getModel(): ChatModel {
+    const modelRef = this.getSummarizerModel()?.trim();
+    if (!modelRef) {
+      const model = this.ctx.model;
+      if (!model) {
+        throw new Error("No active model is available for OptChat compaction.");
+      }
+      return model;
+    }
+
+    return resolveConfiguredModel(this.ctx, modelRef);
   }
 
   public pump(): void {
@@ -668,10 +722,7 @@ export class OptChatCompactor {
     ];
 
     const attempts: string[] = [];
-    const model = this.model ?? this.ctx.model;
-    if (!model) {
-      throw new Error("No active model is available for OptChat compaction.");
-    }
+    const model = this.getModel();
 
     for (let attempt = 0; attempt < DEFAULTS.maxTries; attempt++) {
       const prompt = conversation
@@ -835,12 +886,28 @@ function escapeHtml(str: string): string {
 // Pi Extension Entry Point
 // ============================================================================
 
-export default function (pi: ExtensionAPI) {
-  let identity = DEFAULTS.identity;
+export function createOptChat(options: OptChatExtensionOptions = {}) {
+  let releaseStorage = () => {};
+  const factory: OptChatExtensionFactory = Object.assign(
+    (pi: ExtensionAPI) => {
+  let identity = options.identity ?? DEFAULTS.identity;
   let memoryPath: string | undefined;
   let storage: OptChatStorage | undefined;
   let memory: OptChatMemory | undefined;
   let compactor: OptChatCompactor | undefined;
+  const getSummarizerModel = () => {
+    if (options.getSummarizerModel) {
+      return options.getSummarizerModel();
+    }
+    const configured = pi.getFlag("optchat-model");
+    return typeof configured === "string" ? configured : undefined;
+  };
+  releaseStorage = () => {
+    storage?.unlock();
+    storage = undefined;
+    memory = undefined;
+    compactor = undefined;
+  };
 
   // 1. Register CLI Flags for identity and storage path customization
   pi.registerFlag("optchat-identity", {
@@ -870,7 +937,7 @@ export default function (pi: ExtensionAPI) {
       const info = `
 Identity: ${identity}
 Memory Directory: ${memoryPath}
-Summarizer Model: ${compactor?.model ? `${compactor.model.provider}/${compactor.model.id}` : "active Pi model"}
+Summarizer Model: ${compactor?.modelReference ?? "active Pi model"}
 Total Messages: ${memory.root.length}
 Summary Nodes Built: ${memory.tree.size}
 View Parts Count: ${memory.viewParts.length}
@@ -948,39 +1015,27 @@ Is Settled: ${memory.isSettled()}
   pi.on("session_start", async (_event, ctx) => {
     // Resolve Identity
     const flagIdentity = pi.getFlag("optchat-identity");
-    if (typeof flagIdentity === "string" && flagIdentity.trim()) {
+    if (!options.identity && typeof flagIdentity === "string" && flagIdentity.trim()) {
       identity = flagIdentity.trim();
     }
 
     // Resolve Memory Directory
     const flagDir = pi.getFlag("optchat-dir");
-    if (typeof flagDir === "string" && flagDir.trim()) {
+    if (options.memoryPath) {
+      memoryPath = path.resolve(options.memoryPath);
+    } else if (typeof flagDir === "string" && flagDir.trim()) {
       memoryPath = path.resolve(flagDir.trim());
     } else {
       memoryPath = path.join(os.homedir(), ".optchat", "memories", identity.toLowerCase());
     }
 
-    let compactorModel:
-      | NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>
-      | undefined;
-    const flagModel = pi.getFlag("optchat-model");
-    if (typeof flagModel === "string" && flagModel.trim()) {
-      const modelRef = flagModel.trim();
-      const separator = modelRef.indexOf("/");
-      if (separator <= 0 || separator === modelRef.length - 1) {
+    const summarizerModelRef = getSummarizerModel()?.trim();
+    if (summarizerModelRef) {
+      try {
+        resolveConfiguredModel(ctx, summarizerModelRef);
+      } catch (err) {
         ctx.ui.notify(
-          `Invalid --optchat-model '${modelRef}'. Use provider/model-id, for example anthropic/claude-sonnet-4-5.`,
-          "error"
-        );
-        return;
-      }
-
-      const provider = modelRef.slice(0, separator);
-      const modelId = modelRef.slice(separator + 1);
-      compactorModel = ctx.modelRegistry.find(provider, modelId);
-      if (!compactorModel) {
-        ctx.ui.notify(
-          `OptChat summarizer model '${modelRef}' was not found in Pi's model registry.`,
+          err instanceof Error ? err.message : String(err),
           "error"
         );
         return;
@@ -1000,11 +1055,14 @@ Is Settled: ${memory.isSettled()}
     memory = new OptChatMemory(storage, identity);
     memory.initFromStorage();
 
-    compactor = new OptChatCompactor(memory, ctx, compactorModel);
+    compactor = new OptChatCompactor(memory, ctx, getSummarizerModel);
 
     ctx.ui.notify(
-      `[${identity}] Endless Memory active at: ${memoryPath} (${memory.root.length} msgs loaded; summarizer: ${compactorModel ? `${compactorModel.provider}/${compactorModel.id}` : "active Pi model"})`,
+      `[${identity}] Endless Memory active at: ${memoryPath} (${memory.root.length} msgs loaded; summarizer: ${compactor?.modelReference ?? "active Pi model"})`,
       "info"
+    );
+    console.info(
+      `[OptChat] Writing ${identity} memory to ${path.join(memoryPath, "chat", "main")}`
     );
 
     // Initial pump
@@ -1013,9 +1071,7 @@ Is Settled: ${memory.isSettled()}
 
   // 5. Session Shutdown Hook
   pi.on("session_shutdown", async () => {
-    if (storage) {
-      storage.unlock();
-    }
+    releaseStorage();
   });
 
   // 6. Before Agent Start Hook (Inject System Prompt & View)
@@ -1051,6 +1107,41 @@ Is Settled: ${memory.isSettled()}
         content: viewRendered,
         display: false,
       },
+    };
+  });
+
+  // Keep OptChat's memory view and the current turn, but discard the older Pi
+  // transcript so the same conversation is not sent twice.
+  pi.on("context", (event) => {
+    if (!memory) return;
+
+    let lastUserIndex = -1;
+    for (let i = event.messages.length - 1; i >= 0; i--) {
+      if (event.messages[i]?.role === "user") {
+        lastUserIndex = i;
+        break;
+      }
+    }
+
+    const view = event.messages.find(
+      (message) =>
+        message.role === "custom" && message.customType === "optchat-view"
+    );
+    if (lastUserIndex < 0) {
+      return { messages: view ? [view] : [] };
+    }
+
+    return {
+      messages: [
+        ...(view ? [view] : []),
+        ...event.messages
+          .slice(lastUserIndex)
+          .filter(
+            (message) =>
+              message.role !== "custom" ||
+              message.customType !== "optchat-view"
+          ),
+      ],
     };
   });
 
@@ -1090,4 +1181,10 @@ Is Settled: ${memory.isSettled()}
       compactor.pump();
     }
   });
+    },
+    { shutdown: () => releaseStorage() }
+  );
+  return factory;
 }
+
+export default createOptChat();

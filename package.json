@@ -1,14 +1,31 @@
 {
   "name": "optchat",
   "type": "module",
+  "version": "1.0.0",
+  "license": "MIT",
+  "description": "Implementation of OptChat as a Pi extension package",
   "keywords": [
     "pi-package"
+  ],
+  "main": "./dist/optchat.js",
+  "types": "./dist/optchat.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/optchat.d.ts",
+      "import": "./dist/optchat.js"
+    }
+  },
+  "files": [
+    "dist",
+    "extensions"
   ],
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^1.0.4",
     "typebox": "1.3.27"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit"
   },
   "pi": {
