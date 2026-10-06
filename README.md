@@ -14,6 +14,12 @@ pi --extension ./extensions/optchat.ts \
   [--optchat-model <model_name>]
 ```
 
+This extension targets the pi 1 SDK.
+
+Use `/optchat-import <file-path> [--topic <topic>]` to import JSON, JSONL,
+Markdown, or plain-text notes. Quote paths or topics that contain spaces. The
+agent can also save durable memories with the `write_note` tool.
+
 Written by Gemini 3.6 Thinking + GPT 6 Luna. Not my handiwork.
 
 ## License

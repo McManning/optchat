@@ -36,6 +36,13 @@ export interface LogMessage {
   date: string;
 }
 
+export interface NoteImportItem {
+  text: string;
+  date?: string;
+  tags?: string[];
+  source: string;
+}
+
 export type OptChatExtensionFactory = ((
   pi: ExtensionAPI
 ) => void | Promise<void>) & {
@@ -131,6 +138,124 @@ function getLocalDateString(date: Date = new Date()): string {
   const mm = String(date.getMonth() + 1).padStart(2, "0");
   const dd = String(date.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+export class OptChatNoteParser {
+  public static parseFile(filePath: string): NoteImportItem[] {
+    const resolvedPath = path.resolve(filePath);
+    const content = fs.readFileSync(resolvedPath, "utf-8");
+    const extension = path.extname(resolvedPath).toLowerCase();
+
+    if (extension === ".json") {
+      const parsed: unknown = JSON.parse(content);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      return items.flatMap((item) => parseNoteItem(item, resolvedPath));
+    }
+
+    if (extension === ".jsonl") {
+      return content
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            return parseNoteItem(JSON.parse(line), resolvedPath);
+          } catch (error) {
+            if (error instanceof SyntaxError) {
+              return [{ text: line, source: resolvedPath }];
+            }
+            throw error;
+          }
+        });
+    }
+
+    if (extension === ".md") {
+      return content
+        .split(/\n(?=#+\s+)/g)
+        .map((text) => text.trim())
+        .filter(Boolean)
+        .map((text) => ({ text, source: resolvedPath }));
+    }
+
+    return content
+      .split(/\n\s*\n/)
+      .map((text) => text.trim())
+      .filter(Boolean)
+      .map((text) => ({ text, source: resolvedPath }));
+  }
+}
+
+function parseNoteItem(value: unknown, source: string): NoteImportItem[] {
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? [{ text, source }] : [];
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+
+  const item = value as Record<string, unknown>;
+  const text = [item.text, item.note, item.content].find(
+    (candidate): candidate is string =>
+      typeof candidate === "string" && candidate.trim().length > 0
+  );
+  if (!text) return [];
+
+  const date =
+    typeof item.date === "string"
+      ? item.date
+      : typeof item.timestamp === "string"
+        ? item.timestamp
+        : undefined;
+  const tags = Array.isArray(item.tags)
+    ? item.tags.filter((tag): tag is string => typeof tag === "string")
+    : undefined;
+  return [{ text: text.trim(), date, tags, source }];
+}
+
+function tokenizeCommandArgs(input: string): string[] {
+  const tokens: string[] = [];
+  let token = "";
+  let quote: "'" | '"' | undefined;
+  let escaping = false;
+  let started = false;
+
+  for (const char of input) {
+    if (escaping) {
+      token += char;
+      escaping = false;
+    } else if (quote) {
+      if (char === quote) quote = undefined;
+      else if (char === "\\") escaping = true;
+      else token += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (/\s/.test(char)) {
+      if (started) {
+        tokens.push(token);
+        token = "";
+        started = false;
+      }
+    } else {
+      token += char;
+      started = true;
+    }
+  }
+
+  if (quote || escaping) throw new Error("Unterminated quoted argument.");
+  if (started) tokens.push(token);
+  return tokens;
+}
+
+function buildNoteText(note: string, topic?: string, tags?: string[]): string {
+  const text = note.trim();
+  if (!text) throw new Error("Note text cannot be empty.");
+  const metadata = [
+    topic?.trim() ? `[${topic.trim()}]` : "",
+    tags?.length
+      ? `(${tags.map((tag) => tag.trim()).filter(Boolean).join(", ")})`
+      : "",
+  ].filter(Boolean);
+  return `${metadata.length ? `${metadata.join(" ")} ` : ""}${text}`;
 }
 
 // Realistic 512-byte example scale line for LLM compactor prompt
@@ -320,7 +445,11 @@ export class OptChatMemory {
     this.rebuildView();
   }
 
-  public log(kind: MessageKind, text: string): LogMessage {
+  public log(
+    kind: MessageKind,
+    text: string,
+    date = new Date().toISOString()
+  ): LogMessage {
     const i = this.root.length;
     const cappedText = kind === "echo" ? capText(text, DEFAULTS.maxCap) : text;
     const rawLine = `${kind}: ${cappedText}`;
@@ -330,7 +459,7 @@ export class OptChatMemory {
       kind,
       text: cappedText,
       size,
-      date: new Date().toISOString(),
+      date,
     };
 
     this.root.push(msg);
@@ -961,7 +1090,119 @@ Is Settled: ${memory.isSettled()}
     },
   });
 
+  pi.registerCommand("optchat-import", {
+    description:
+      "Import notes from a JSON, JSONL, Markdown, or plain-text file into OptChat memory.",
+    handler: async (args, ctx) => {
+      if (!memory) {
+        ctx.ui.notify("OptChat is not initialized.", "error");
+        return;
+      }
+
+      let imported = 0;
+      try {
+        const tokens = tokenizeCommandArgs(args);
+        const filePath = tokens.shift();
+        if (!filePath) {
+          throw new Error(
+            "Usage: /optchat-import <file-path> [--topic <topic>]"
+          );
+        }
+
+        let topic: string | undefined;
+        while (tokens.length > 0) {
+          const option = tokens.shift();
+          if (option !== "--topic" || topic !== undefined || !tokens[0]) {
+            throw new Error(
+              "Usage: /optchat-import <file-path> [--topic <topic>]"
+            );
+          }
+          topic = tokens.shift();
+        }
+
+        const items = OptChatNoteParser.parseFile(filePath);
+        if (items.length === 0) {
+          ctx.ui.notify(`No importable notes found in ${filePath}.`, "warning");
+          return;
+        }
+
+        for (const item of items) {
+          memory.log(
+            "note",
+            buildNoteText(item.text, topic, item.tags),
+            item.date
+          );
+          imported++;
+        }
+        compactor?.pump();
+        ctx.ui.notify(
+          `Imported ${imported} note(s) from ${path.basename(filePath)} into OptChat memory.`,
+          "info"
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(
+          imported
+            ? `Import stopped after ${imported} note(s): ${message}`
+            : `Import failed: ${message}`,
+          "error"
+        );
+      }
+    },
+  });
+
   // 3. Register Navigation Tools for LLM
+  pi.registerTool({
+    name: "write_note",
+    label: "Write OptChat note",
+    description:
+      "Save a long-term note, decision, learning, or preference to OptChat memory. Notes are preserved as high-priority memory.",
+    parameters: Type.Object({
+      note: Type.String({ description: "The note content to preserve." }),
+      topic: Type.Optional(
+        Type.String({ description: "Optional topic or title." })
+      ),
+      tags: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Optional tags for categorization.",
+        })
+      ),
+    }),
+    execute: async (_toolCallId, { note, topic, tags }) => {
+      if (!memory) {
+        return {
+          content: [
+            { type: "text", text: "Error: OptChat memory not initialized." },
+          ],
+          details: undefined,
+        };
+      }
+
+      try {
+        const message = memory.log(
+          "note",
+          buildNoteText(note, topic, tags)
+        );
+        compactor?.pump();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Note #${message.i} written to OptChat memory.`,
+            },
+          ],
+          details: undefined,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `Failed to write note: ${message}` }],
+          details: undefined,
+        };
+      }
+    },
+  });
+
   pi.registerTool({
     name: "zoom",
     label: "Zoom into chat memory",
