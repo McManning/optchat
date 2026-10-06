@@ -1,27 +1,28 @@
-# OptChat Pi Extension
+# OptChat
 
-Implementation of https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449 for a trial run of the strategy.
+OptChat is a Pi extension for one ongoing chat with persistent memory. Every message is kept in an append-only log, while a background compactor builds a binary tree of summaries. Each turn starts fresh with a bounded view of the conversation, and the agent can zoom in on older details when needed.
+
+Minimal implementation of https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449 for a trial run of the strategy. Omits subagent orchestration and advanced features.
 
 All credit to Victor on this one.
 
-## tl;dr
+## Why
+
+Typical chat compaction discards detail, while separate memory files require manual curation and can lose context. OptChat keeps the original history and summarizes it at multiple levels, so the agent can recover specifics without loading the whole conversation every turn.
+
+## Usage
 
 ```sh
-# Run the extension under a specific identity and memory storage.
 pi --extension ./extensions/optchat.ts \
-  --optchat-identity Chasebot \
-  --optchat-dir /workspace/chasebot_memory \
+  --optchat-identity MyAgent \
+  --optchat-dir ./optchat-memory \
   [--optchat-model <model_name>]
 ```
 
-This extension targets the pi 1 SDK.
-
-Use `/optchat-import <file-path> [--topic <topic>]` to import JSON, JSONL,
-Markdown, or plain-text notes. Quote paths or topics that contain spaces. The
-agent can also save durable memories with the `write_note` tool.
-
-Written by Gemini 3.6 Thinking + GPT 6 Luna. Not my handiwork.
+Import existing notes with `/optchat-import <file-path> [--topic <topic>]`. Use `/optchat-info` to check memory status and `/optchat-export` to browse the full history.
 
 ## License
 
 MIT cuz who cares.
+
+Written by Gemini 3.6 Thinking + GPT 6 Luna. Not my handiwork.

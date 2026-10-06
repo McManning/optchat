@@ -69,6 +69,7 @@ export interface OptChatExtensionOptions {
   identity?: string;
   memoryPath?: string;
   getSummarizerModel?: () => string | undefined;
+  onPromptContext?: (context: string) => void;
 }
 
 type ChatModel = NonNullable<
@@ -1340,6 +1341,20 @@ Is Settled: ${memory.isSettled()}
     const masterPrompt = buildMasterSystemPrompt(identity);
     const viewDocPrompt = buildViewDocPrompt(identity);
     const fullSystemPrompt = `${masterPrompt}\n\n${viewDocPrompt}\n\n${event.systemPrompt || ""}`;
+
+    options.onPromptContext?.(
+      [
+        "=== System prompt ===",
+        fullSystemPrompt,
+        "=== OptChat memory view ===",
+        viewRendered,
+        "=== Current user prompt ===",
+        event.prompt || "(empty)",
+        ...(event.images?.length
+          ? [`[${event.images.length} image(s) attached to the prompt]`]
+          : []),
+      ].join("\n")
+    );
 
     return {
       systemPrompt: fullSystemPrompt,
